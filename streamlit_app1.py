@@ -1,369 +1,305 @@
 # app.py
-import streamlit as st
-from streamlit_option_menu import option_menu
-from streamlit_folium import st_folium
-import folium
-from folium import plugins
-import numpy as np
+# Solar Mapping & Recommendation System — Streamlit
+# Works offline, fetches NASA POWER if online, multiple fallbacks included.
+
 import math
-import json
-import requests
-import plotly.graph_objects as go
-from fpdf import FPDF
-from io import BytesIO
-import tempfile
+import time
 from datetime import datetime
+import requests
+import numpy as np
+import pandas as pd
+import streamlit as st
+import folium
+from streamlit_folium import st_folium
+import matplotlib.pyplot as plt
 
-# -------------------------
-# App config + basic style
-# -------------------------
-st.set_page_config(page_title="Solar Suite", layout="wide", initial_sidebar_state="collapsed")
-st.markdown(
+st.set_page_config(page_title="Solar Mapping & Recommendation System",
+                   page_icon="☀️", layout="wide")
+
+# ---------------------------- Helpers ---------------------------- #
+
+@st.cache_data(show_spinner=False)
+def fetch_nasa_power_monthly(lat, lon):
     """
-    <style>
-      .stApp { background-image: url('https://images.unsplash.com/photo-1509395176047-4a66953fd231?auto=format&fit=crop&w=1920&q=80');
-              background-size: cover; background-attachment: fixed; }
-      .card { background: rgba(255,255,255,0.95); padding:16px; border-radius:12px; }
-      .title { font-size: 28px; font-weight:700; color:#083d33; }
-      .slogan { color:#d97706; font-weight:600; }
-    </style>
-    """, unsafe_allow_html=True)
-st.markdown('<div class="title">☀️ Solar Suite — Mapping · Forecast · Layout · Reports</div>', unsafe_allow_html=True)
-st.markdown('<div class="slogan">Draw your rooftop, see forecasts, design panel layout, and export a report.</div>', unsafe_allow_html=True)
-
-# -------------------------
-# Navigation menu (icons)
-# -------------------------
-with st.sidebar:
-    selected = option_menu(
-        menu_title=None,
-        options=["Map", "Forecast", "Panel Layout", "Chatbot", "Reports"],
-        icons=["geo-alt", "bar-chart", "grid-1x2", "robot", "file-earmark-text"],
-        menu_icon="solar-panel",
-        default_index=0,
-        orientation="vertical",
-    )
-
-# -------------------------
-# Shared app state (session)
-# -------------------------
-if "polygon" not in st.session_state:
-    st.session_state.polygon = None  # list of [lon,lat] pairs (outer ring)
-if "marker" not in st.session_state:
-    st.session_state.marker = None   # (lat, lon)
-if "area_m2" not in st.session_state:
-    st.session_state.area_m2 = None
-if "ghi_monthly" not in st.session_state:
-    st.session_state.ghi_monthly = None
-if "monthly_kwh" not in st.session_state:
-    st.session_state.monthly_kwh = None
-if "panels_fit" not in st.session_state:
-    st.session_state.panels_fit = None
-
-# -------------------------
-# Shared controls (sidebar compact)
-# -------------------------
-with st.sidebar:
-    st.markdown("---")
-    st.header("Quick Settings")
-    panel_watt = st.number_input("Panel watt (W)", value=400, step=50)
-    panel_eff = st.slider("Panel eff (%)", 10, 23, 18) / 100.0
-    coverage = st.slider("Coverage fraction", 40, 95, 80) / 100.0
-    tilt_deg = st.slider("Tilt (deg)", 0, 45, 20)
-    derate = st.slider("Derate (losses)", 60, 90, 75) / 100.0
-    shading_pct = st.slider("Shading loss (%)", 0, 60, 10)
-    st.markdown("---")
-    st.caption("Use the side menu to switch pages. Draw polygon on Map page. Click map to place a marker (single click).")
-
-# -------------------------
-# Helper functions
-# -------------------------
-def polygon_area_m2(coords):
-    """Approximate polygon area in m². coords: [[lon,lat],...] outer ring"""
-    if not coords or len(coords) < 3:
-        return 0.0
-    xs = np.array([c[0] for c in coords])
-    ys = np.array([c[1] for c in coords])
-    lat_mean = np.mean(ys)
-    lon_to_m = 111320 * math.cos(math.radians(lat_mean))
-    lat_to_m = 110540
-    xm = (xs - xs[0]) * lon_to_m
-    ym = (ys - ys[0]) * lat_to_m
-    area = 0.5 * abs(np.dot(xm, np.roll(ym, 1)) - np.dot(ym, np.roll(xm, 1)))
-    return float(area)
-
-def fetch_solar_ghi(lat, lon):
-    """Try NASA POWER, then PVGIS, else fallback 5.0"""
-    try:
-        url = f"https://power.larc.nasa.gov/api/temporal/climatology/point?parameters=ALLSKY_SFC_SW_DWN&community=RE&longitude={lon}&latitude={lat}&format=JSON"
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        ghi_m = {k: float(v) for k, v in data["properties"]["parameter"]["ALLSKY_SFC_SW_DWN"].items()}
-        return float(np.mean(list(ghi_m.values()))), ghi_m, "NASA POWER"
-    except Exception:
-        pass
-    try:
-        url = f"https://re.jrc.ec.europa.eu/api/DRcalc?lat={lat}&lon={lon}&outputformat=json"
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        monthly = data["outputs"]["monthly"]["fixed"]["E_d"]
-        days = [31,28,31,30,31,30,31,31,30,31,30,31]
-        ghi_m = {f"{i+1:02d}": float(monthly[i]/days[i]) for i in range(12)}
-        return float(np.mean(list(ghi_m.values()))), ghi_m, "PVGIS"
-    except Exception:
-        pass
-    ghi_m = {f"{i:02d}": 5.0 for i in range(1,13)}
-    return 5.0, ghi_m, "Fallback (5.0)"
-
-def monthly_output_kwh(area_m2, ghi_monthly, panel_eff, coverage, tilt_deg, derate, shading_pct, latitude):
-    days_in_month = [31,28,31,30,31,30,31,31,30,31,30,31]
-    active_area = area_m2 * coverage
-    tilt_factor = max(0.5, math.cos(math.radians(tilt_deg - abs(latitude))))
-    shading = max(0.0, 1 - shading_pct/100.0)
-    out = []
-    for i in range(12):
-        ghi = float(ghi_monthly.get(f"{i+1:02d}", 5.0))
-        kwh = active_area * ghi * panel_eff * tilt_factor * days_in_month[i] * derate * shading
-        out.append(kwh)
-    return out
-
-def compute_layout(area_m2, coverage, panel_watt):
-    panel_area = 1.9  # m2 incl spacing
-    usable = area_m2 * coverage
-    panels = int(max(0, usable // panel_area))
-    system_kw = round(panels * panel_watt / 1000.0, 2)
-    return panels, system_kw
-
-def make_pdf(context):
-    # small PDF builder: summary + charts embedded
-    from fpdf import FPDF
-    import matplotlib.pyplot as plt
-    # monthly chart
-    months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-    fig, ax = plt.subplots(figsize=(8,3))
-    ax.plot(months, context["monthly_kwh"], marker="o")
-    ax.set_title("Monthly Solar Output (kWh)")
-    ax.set_ylabel("kWh")
-    ax.grid(True, alpha=0.3)
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-    fig.savefig(tmp.name, bbox_inches="tight", dpi=150)
-    plt.close(fig)
-    # compose PDF
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", "B", 14)
-    pdf.cell(0, 8, "Solar Report", ln=True)
-    pdf.set_font("Arial", size=11)
-    pdf.ln(2)
-    pdf.multi_cell(0, 6, f"Location (approx): {context['lat']:.5f}, {context['lon']:.5f}")
-    pdf.multi_cell(0, 6, f"Estimated rooftop area: {context['area_m2']:.1f} m²")
-    pdf.multi_cell(0, 6, f"Panels fit: {context['panels_fit']}  |  System size: {context['system_kw']:.2f} kW")
-    pdf.ln(4)
-    pdf.image(tmp.name, w=180)
-    out = BytesIO()
-    pdf.output(out)
-    out.seek(0)
-    return out
-
-# -------------------------
-# Page: Map
-# -------------------------
-def page_map():
-    st.header("🌍 Map — pick point / draw rooftop")
-    st.markdown("**Click** on the map to place a marker (single click). Use the **polygon tool** to draw rooftop boundary.")
-    center = [21.0, 78.0]  # India-ish
-    m = folium.Map(location=center, zoom_start=6, control_scale=True)
-    # add tile layer (Esri satellite optional) - Esri imagery (no key)
-    folium.TileLayer(
-        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        attr="Esri",
-        name="Esri Satellite",
-        overlay=False,
-        control=True
-    ).add_to(m)
-    # Add draw plugin (polygon + rectangle)
-    draw = plugins.Draw(export=True, filename="rooftop.geojson",
-                        draw_options={"polyline": False, "circle": False, "marker": False, "circlemarker": False, "polygon": True, "rectangle": True},
-                        edit_options={"edit": True})
-    draw.add_to(m)
-
-    # show existing polygon or marker (if in session)
-    if st.session_state.polygon:
-        folium.Polygon(locations=[(pt[1], pt[0]) for pt in st.session_state.polygon], color="cyan", fill=True, fill_opacity=0.25).add_to(m)
-    if st.session_state.marker:
-        folium.Marker(location=st.session_state.marker, popup="Selected point").add_to(m)
-
-    map_data = st_folium(m, width=900, height=550)
-
-    # handle last click (point selection)
-    if map_data and map_data.get("last_clicked"):
-        last = map_data["last_clicked"]
-        lat, lon = last["lat"], last["lng"]
-        st.session_state.marker = (lat, lon)
-        st.success(f"Marker set at: {lat:.6f}, {lon:.6f}")
-
-    # handle drawings
-    if map_data and map_data.get("last_active_drawing"):
-        geom = map_data["last_active_drawing"].get("geometry")
-        if geom and geom.get("type") == "Polygon":
-            coords = geom["coordinates"][0]  # lon,lat pairs
-            st.session_state.polygon = coords
-            st.session_state.area_m2 = polygon_area_m2(coords)
-            st.info(f"Polygon captured. Area ≈ {st.session_state.area_m2:.1f} m²")
-    # also show all drawings if user exported & pasted
-    if map_data and map_data.get("all_drawings"):
-        # display count
-        st.write(f"Drawings on map: {len(map_data['all_drawings'])}")
-
-# -------------------------
-# Page: Forecast
-# -------------------------
-def page_forecast():
-    st.header("📈 Forecast")
-    st.markdown("This page computes solar resource (tries NASA → PVGIS → fallback) and monthly output.")
-    if not st.session_state.polygon and not st.session_state.marker:
-        st.info("Please draw a rooftop polygon on the **Map** page or click to set a point.")
-        return
-    # determine coordinate to query (centroid of polygon or marker)
-    if st.session_state.polygon:
-        coords = st.session_state.polygon
-        lat = float(np.mean([p[1] for p in coords])); lon = float(np.mean([p[0] for p in coords]))
-    else:
-        lat, lon = st.session_state.marker
-
-    ghi_avg, ghi_monthly, src = fetch_solar_ghi(lat, lon)
-    st.info(f"Solar resource source: {src} (avg {ghi_avg:.2f} kWh/m²/day)")
-    st.session_state.ghi_monthly = ghi_monthly
-
-    monthly_kwh = monthly_output_kwh(
-        area_m2=st.session_state.area_m2 or 50.0,
-        ghi_monthly=ghi_monthly,
-        panel_eff=panel_eff,
-        coverage=coverage,
-        tilt_deg=tilt_deg,
-        derate=derate,
-        shading_pct=shading_pct,
-        latitude=lat
-    )
-    st.session_state.monthly_kwh = monthly_kwh
-    months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=months, y=monthly_kwh, name="kWh"))
-    fig.update_layout(title="Monthly Output (kWh)", template="plotly_white")
-    st.plotly_chart(fig, use_container_width=True)
-
-    annual = sum(monthly_kwh)
-    st.metric("Estimated annual energy (kWh)", f"{annual:,.0f}")
-
-# -------------------------
-# Page: Panel Layout
-# -------------------------
-def page_layout():
-    st.header("🔆 Panel Layout")
-    st.markdown("Visual, interactive panel grid. Hover to see per-panel kWh (conceptual).")
-    if not st.session_state.monthly_kwh:
-        st.info("Run Forecast (or draw polygon) first.")
-        return
-    area = st.session_state.area_m2 or 50.0
-    panels, system_kw = compute_layout(area, coverage, panel_watt)
-    st.session_state.panels_fit = panels
-
-    st.write(f"Panels that fit (estimate): **{panels}** — System size ≈ **{system_kw:.2f} kW**")
-
-    if panels <= 0:
-        st.warning("No panels fit with the current coverage/area. Increase coverage or use a larger roof.")
-        return
-
-    cols_guess = max(4, min(14, int(math.sqrt(panels) * 1.2)))
-    rows_guess = math.ceil(panels / cols_guess)
-    per_panel_annual = sum(st.session_state.monthly_kwh) / panels if panels else 0.0
-
-    xs, ys, hover = [], [], []
-    idx = 0
-    for r in range(rows_guess):
-        for c in range(cols_guess):
-            if idx >= panels:
-                break
-            xs.append(c); ys.append(-r)
-            hover.append(f"Panel #{idx+1}<br>{panel_watt} W<br>~{per_panel_annual:.1f} kWh/yr")
-            idx += 1
-
-    fig = go.Figure(data=go.Scatter(x=xs, y=ys, mode="markers",
-                                    marker=dict(size=28, symbol="square", color="goldenrod"),
-                                    hovertext=hover, hoverinfo="text"))
-    fig.update_layout(title="Hover panels to see per-panel energy", xaxis=dict(visible=False), yaxis=dict(visible=False), height=420, template="plotly_white")
-    st.plotly_chart(fig, use_container_width=True)
-
-# -------------------------
-# Page: Chatbot
-# -------------------------
-def page_chatbot():
-    st.header("🤖 Solar Assistant")
-    st.markdown("Ask about tilt, costs, payback, battery, shading, or grid rules.")
-    q = st.text_input("Ask a question:")
-    if q:
-        ql = q.lower()
-        if "tilt" in ql:
-            st.write("Rule of thumb: tilt ≈ latitude. Seasonal tilt or trackers improve yield but cost more.")
-        elif "cost" in ql or "price" in ql:
-            st.write(f"Rough PV installed cost used here: ₹{bos_cost_per_kw}/kW (adjust in sidebar). Panel + inverter + structure vary regionally.")
-        elif "battery" in ql:
-            st.write("Battery sizing: daily_load × autonomy_days -> usable kWh. Nameplate = usable / DoD.")
-        elif "payback" in ql:
-            st.write("Payback depends on tariffs, metering model, subsidies, and self-consumption. Use Forecast + Reports pages to compute.")
-        else:
-            st.write("Great question! If you include keywords like 'tilt', 'cost', 'battery', 'payback', I'll give tailored answers.")
-
-# -------------------------
-# Page: Reports
-# -------------------------
-def page_reports():
-    st.header("📄 Reports & Export")
-    st.markdown("Generate a PDF summary of your rooftop analysis (based on the polygon & forecast).")
-    if not st.session_state.monthly_kwh:
-        st.info("Run Forecast first to generate data.")
-        return
-    # build context
-    if st.session_state.polygon:
-        lat = float(np.mean([p[1] for p in st.session_state.polygon])); lon = float(np.mean([p[0] for p in st.session_state.polygon]))
-    else:
-        lat, lon = st.session_state.marker or (0.0, 0.0)
-    area = st.session_state.area_m2 or 0.0
-    panels, system_kw = compute_layout(area, coverage, panel_watt)
-    annual_kwh = sum(st.session_state.monthly_kwh)
-    install_cost_pv = system_kw * bos_cost_per_kw
-    ctx = {
-        "lat": lat, "lon": lon, "area_m2": area, "panels_fit": panels,
-        "system_kw": system_kw, "monthly_kwh": st.session_state.monthly_kwh,
-        "annual_kwh": annual_kwh, "panel_watt": panel_watt,
-        "ghi_monthly": st.session_state.ghi_monthly or {f"{i:02d}":5.0 for i in range(1,13)}
+    Fetch monthly average GHI (ALLSKY_SFC_SW_DWN, kWh/m2/day) from NASA POWER Climatology (2001-2020)
+    Returns dict: {month_name: kWh/m2/day}
+    Falls back to one of two predefined PSH profiles if request fails.
+    """
+    month_map = {
+        "01":"Jan","02":"Feb","03":"Mar","04":"Apr","05":"May","06":"Jun",
+        "07":"Jul","08":"Aug","09":"Sep","10":"Oct","11":"Nov","12":"Dec"
     }
-    st.write("Quick summary:")
-    st.metric("Area (m²)", f"{area:.1f}")
-    st.metric("Panels", panels)
-    st.metric("System (kW)", f"{system_kw:.2f}")
-    if st.button("Generate & Download PDF"):
-        pdf_bytes = make_pdf(ctx)
-        st.download_button("Download report (PDF)", pdf_bytes, file_name="solar_report.pdf", mime="application/pdf")
 
-# -------------------------
-# Router: show selected page
-# -------------------------
-if selected == "Map":
-    page_map()
-elif selected == "Forecast":
-    page_forecast()
-elif selected == "Panel Layout":
-    page_layout()
-elif selected == "Chatbot":
-    page_chatbot()
-elif selected == "Reports":
-    page_reports()
+    # Two fallback profiles
+    fallback_india = {
+        "Jan":4.5,"Feb":5.2,"Mar":6.0,"Apr":6.4,"May":6.5,"Jun":5.5,
+        "Jul":4.8,"Aug":5.0,"Sep":5.8,"Oct":5.7,"Nov":5.0,"Dec":4.6
+    }
+    fallback_global = {
+        "Jan":3.5,"Feb":4.0,"Mar":4.5,"Apr":5.0,"May":5.2,"Jun":5.0,
+        "Jul":4.8,"Aug":4.9,"Sep":4.7,"Oct":4.5,"Nov":4.0,"Dec":3.8
+    }
 
-# -------------------------
-# Footer
-# -------------------------
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            base = "https://power.larc.nasa.gov/api/temporal/climatology/point"
+            params = {
+                "parameters": "ALLSKY_SFC_SW_DWN",
+                "community": "RE",
+                "longitude": lon,
+                "latitude": lat,
+                "format": "JSON"
+            }
+            r = requests.get(base, params=params, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            values = data["properties"]["parameter"]["ALLSKY_SFC_SW_DWN"]
+            monthly = {month_map[k]: float(v) for k,v in values.items()}
+            st.success("NASA POWER monthly averages loaded successfully.")
+            return monthly
+        except Exception as e:
+            st.warning(f"Attempt {attempt+1} to fetch NASA POWER failed...")
+            time.sleep(1)
+
+    # If all attempts fail, pick fallback based on latitude
+    st.warning("Could not fetch NASA POWER data. Using fallback PSH profiles.")
+    if abs(lat) < 30:  # Near India
+        return fallback_india
+    else:
+        return fallback_global
+
+
+def days_in_months(year=2024):
+    return {"Jan":31,"Feb":29 if (year%4==0 and (year%100!=0 or year%400==0)) else 28,
+            "Mar":31,"Apr":30,"May":31,"Jun":30,"Jul":31,"Aug":31,
+            "Sep":30,"Oct":31,"Nov":30,"Dec":31}
+
+def suitability_score(roof_area_m2, monthly_psh_dict, shading_factor, tilt_deg, lat):
+    if not monthly_psh_dict:
+        resource_score = 50
+    else:
+        avg_psh = np.mean(list(monthly_psh_dict.values()))
+        resource_score = np.clip(20 + (avg_psh-3)*18, 20, 95)
+    area_score = 30 + np.clip((roof_area_m2-10)*1.5, 0, 65)
+    shade_score = np.clip(100 - shading_factor*100, 10, 100)
+    ideal = abs(abs(lat) - tilt_deg)
+    tilt_score = np.clip(100 - ideal*2.2, 40, 100)
+    weights = [0.35, 0.25, 0.2, 0.2]
+    final = resource_score*weights[0] + area_score*weights[1] + shade_score*weights[2] + tilt_score*weights[3]
+    return round(final, 1)
+
+def compute_panels_fit(roof_w, roof_h, panel_w, panel_h, clearance, orientation="Portrait"):
+    if orientation == "Landscape":
+        pw, ph = panel_h, panel_w
+    else:
+        pw, ph = panel_w, panel_h
+    avail_w = max(roof_w - 2*clearance, 0)
+    avail_h = max(roof_h - 2*clearance, 0)
+    def count_axis(avail, p):
+        if p <= 0: return 0
+        return max(int((avail + clearance) // (p + clearance)), 0)
+    cols = count_axis(avail_w, pw)
+    rows = count_axis(avail_h, ph)
+    count = rows * cols
+    return count, rows, cols
+
+def monthly_energy_kwh(system_kw, monthly_psh, days, performance_ratio, shading_factor):
+    return system_kw * monthly_psh * days * performance_ratio * (1 - shading_factor)
+
+FAQ = [
+    ("what is psh", "PSH = Peak Sun Hours; approx. daily solar energy in kWh per kW of PV."),
+    ("what is performance ratio", "Performance Ratio (PR) lumps system losses (temperature, wiring, inverter). Typical 0.72–0.82."),
+    ("how many panels", "Panels Fit depends on roof size and panel size/orientation with required clearances."),
+    ("best tilt", "As a thumb rule, set tilt roughly equal to your latitude for year-round balance."),
+    ("payback", "Payback Period = (Install Cost) / (Annual Savings). Lower is better.")
+]
+
+def chatbot_reply(msg):
+    text = msg.lower().strip()
+    if not text:
+        return "Ask me anything about solar sizing, costs, tilt, or payback!"
+    if "tilt" in text:
+        return "Best tilt ≈ your latitude. If you want more summer energy, tilt a bit lower; for winter, tilt higher."
+    if "cost" in text or "price" in text:
+        return "Install cost ≈ ₹45–65k per kW (India). Adjust in the sidebar to match quotes in your area."
+    if "payback" in text or "roi" in text:
+        return "Payback = Install Cost / Annual Savings. Faster with higher tariffs, good sun, and net metering."
+    if "panel" in text and ("how many" in text or "count" in text):
+        return "Panel count depends on your roof dimensions, panel size, clearances, and chosen orientation."
+    for k, v in FAQ:
+        if k in text:
+            return v
+    return "Got it! Try asking about tilt, PR, costs, or how panels fit your roof."
+
+# ---------------------------- UI ---------------------------- #
+
+st.title("☀️ Solar Mapping & Recommendation System")
+
+with st.sidebar:
+    st.header("Inputs")
+    st.markdown("**1) Location (pick on map or enter)**")
+    default_lat = 21.2514
+    default_lon = 81.6296
+    lat = st.number_input("Latitude", value=float(default_lat), format="%.6f")
+    lon = st.number_input("Longitude", value=float(default_lon), format="%.6f")
+    st.markdown("---")
+    st.markdown("**2) Rooftop Geometry (Rectangular approximation)**")
+    roof_w = st.number_input("Rooftop Width (m)", min_value=3.0, value=10.0, step=0.5)
+    roof_h = st.number_input("Rooftop Height (m)", min_value=3.0, value=8.0, step=0.5)
+    clearance = st.number_input("Clearance / Spacing (m)", min_value=0.0, value=0.4, step=0.1)
+    st.markdown("---")
+    st.markdown("**3) Panel Specs**")
+    panel_w = st.number_input("Panel Width (m)", min_value=0.8, value=1.1, step=0.01)
+    panel_h = st.number_input("Panel Height (m)", min_value=1.2, value=1.75, step=0.01)
+    panel_watt = st.number_input("Panel Wattage (W)", min_value=200, value=400, step=10)
+    orientation = st.selectbox("Panel Orientation", ["Portrait", "Landscape"])
+    st.markdown("---")
+    st.markdown("**4) Performance & Costs**")
+    performance_ratio = st.slider("Performance Ratio (PR)", 0.6, 0.9, 0.75, 0.01)
+    shading_factor = st.slider("Shading Factor (0=None, 0.3=Medium, 0.6=High)", 0.0, 0.8, 0.1, 0.05)
+    tilt_deg = st.slider("Tilt (°)", 0, 60, int(abs(lat)), 1)
+    cost_per_kw = st.number_input("Installation Cost per kW (₹/kW)", min_value=10000, value=55000, step=1000)
+    tariff = st.number_input("Electricity Tariff (₹/kWh)", min_value=2.0, value=8.0, step=0.5)
+    st.markdown("---")
+    st.caption("Tip: Click a point on the map to autofill Latitude/Longitude.")
+
+# ---------------------------- Map Picker ---------------------------- #
+st.subheader("📍 Pick Location on Map")
+m = folium.Map(location=[lat, lon], zoom_start=12)
+folium.Marker([lat, lon], tooltip="Selected Location").add_to(m)
+returned = st_folium(m, width=700, height=400)
+if returned and "last_clicked" in returned and returned["last_clicked"] is not None:
+    lat = float(returned["last_clicked"]["lat"])
+    lon = float(returned["last_clicked"]["lng"])
+    with st.sidebar:
+        st.info(f"Map selected: Lat {lat:.5f}, Lon {lon:.5f}")
+
+# ---------------------------- Solar Resource ---------------------------- #
+st.subheader("🔆 Solar Resource (Monthly PSH)")
+
+def fetch_monthly_psh(lat, lon):
+    monthly_psh = fetch_nasa_power_monthly(lat, lon)
+    if monthly_psh is not None:
+        st.success("NASA POWER monthly averages loaded (ALLSKY_SFC_SW_DWN).")
+        return monthly_psh
+    else:
+        st.warning("Could not fetch NASA POWER data. Using fallback PSH profiles.")
+    fallback_india = {
+        "Jan":4.5,"Feb":5.2,"Mar":6.0,"Apr":6.4,"May":6.5,"Jun":5.5,
+        "Jul":4.8,"Aug":5.0,"Sep":5.8,"Oct":5.7,"Nov":5.0,"Dec":4.6
+    }
+    fallback_generic = {
+        "Jan":3.8,"Feb":4.5,"Mar":5.5,"Apr":5.8,"May":6.0,"Jun":5.0,
+        "Jul":4.2,"Aug":4.5,"Sep":5.0,"Oct":5.2,"Nov":4.5,"Dec":4.0
+    }
+    # Use fallback_india first, else generic
+    if fallback_india:
+        return fallback_india
+    else:
+        return fallback_generic
+
+monthly_psh = fetch_monthly_psh(lat, lon)
+
+# ---------------------------- Panel Fit & System Size ---------------------------- #
+st.subheader("📐 Rooftop & Panel Layout")
+roof_area = roof_w * roof_h
+count, rows, cols = compute_panels_fit(roof_w, roof_h, panel_w, panel_h, clearance, orientation)
+system_kw = round((count * panel_watt) / 1000.0, 2)
+
+left, right = st.columns([1.2, 1])
+with left:
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    ax.set_aspect('equal')
+    ax.set_title(f"Layout Preview ({orientation}) — {rows}×{cols} = {count} panels")
+    ax.add_patch(plt.Rectangle((0,0), roof_w, roof_h, fill=False, lw=2))
+    ax.add_patch(plt.Rectangle((clearance, clearance), max(roof_w-2*clearance,0), max(roof_h-2*clearance,0), fill=False, ls="--", lw=1))
+    pw, ph = (panel_h, panel_w) if orientation=="Landscape" else (panel_w, panel_h)
+    x0 = clearance
+    y0 = clearance
+    for r in range(rows):
+        for c in range(cols):
+            x = x0 + c * (pw + clearance)
+            y = y0 + r * (ph + clearance)
+            ax.add_patch(plt.Rectangle((x,y), pw, ph, fill=False))
+    ax.set_xlim(-0.2, roof_w+0.2)
+    ax.set_ylim(-0.2, roof_h+0.2)
+    ax.set_xlabel("Width (m)")
+    ax.set_ylabel("Height (m)")
+    st.pyplot(fig)
+
+with right:
+    st.metric("Rooftop Area", f"{roof_area:.1f} m²")
+    st.metric("Panels Fit", f"{count} panels")
+    st.metric("System Capacity", f"{system_kw:.2f} kW")
+
+# ---------------------------- Monthly Forecast ---------------------------- #
+st.subheader("📈 Monthly Energy Output Forecast")
+dim = days_in_months()
+months = list(monthly_psh.keys())
+monthly_energy = [monthly_energy_kwh(system_kw, monthly_psh[m], dim[m], performance_ratio, shading_factor) for m in months]
+df = pd.DataFrame({
+    "Month": months,
+    "PSH (kWh/kW/day)": [round(monthly_psh[m],2) for m in months],
+    "Days": [dim[m] for m in months],
+    "Energy (kWh)": [round(v,1) for v in monthly_energy]
+})
+annual_energy = round(float(np.sum(monthly_energy)), 1)
+install_cost = round(system_kw * cost_per_kw, 0)
+annual_savings = round(annual_energy * tariff, 0)
+payback_years = round(install_cost / max(annual_savings, 1), 1)
+
+colA, colB, colC, colD = st.columns(4)
+with colA: st.metric("Annual Solar Output", f"{annual_energy:,} kWh/yr")
+with colB: st.metric("Installation Cost", f"₹{install_cost:,.0f}")
+with colC: st.metric("Annual Savings", f"₹{annual_savings:,.0f}")
+with colD: st.metric("Payback Period", f"{payback_years} years")
+
+st.dataframe(df, use_container_width=True)
+fig2, ax2 = plt.subplots(figsize=(7,3.5))
+ax2.bar(df["Month"], df["Energy (kWh)"])
+ax2.set_ylabel("Monthly Energy (kWh)")
+ax2.set_title("Monthly Solar Energy Output")
+st.pyplot(fig2)
+
+# ---------------------------- Suitability ---------------------------- #
+st.subheader("✅ Suitability")
+score = suitability_score(roof_area, monthly_psh, shading_factor, tilt_deg, lat)
+explain = []
+if score >= 80: explain.append("Excellent resource & roof size.")
+elif score >= 65: explain.append("Good potential — consider optimizing tilt/spacing.")
+else: explain.append("Moderate potential — shading or area may be limiting.")
+if shading_factor <= 0.1: explain.append("Low shading.")
+elif shading_factor <= 0.3: explain.append("Some shading present.")
+else: explain.append("Significant shading — trimming or relocating panels may help.")
+explain.append(f"Tilt set to {tilt_deg}°, latitude ≈ {abs(lat):.0f}°.")
+st.progress(min(int(score), 100))
+st.write(f"**Suitability Score:** {score}/100 — " + " ".join(explain))
+
+# ---------------------------- Chatbot ---------------------------- #
+st.subheader("💬 Ask the Solar Chatbot")
+if "chat" not in st.session_state:
+    st.session_state.chat = [{"role":"assistant","content":"Hi! Ask me about panels, costs, tilt, PR, or payback."}]
+for m in st.session_state.chat:
+    with st.chat_message(m["role"]):
+        st.write(m["content"])
+user_msg = st.chat_input("Type your question…")
+if user_msg:
+    st.session_state.chat.append({"role":"user","content":user_msg})
+    reply = chatbot_reply(user_msg)
+    st.session_state.chat.append({"role":"assistant","content":reply})
+    with st.chat_message("user"): st.write(user_msg)
+    with st.chat_message("assistant"): st.write(reply)
+
+# ---------------------------- Summary ---------------------------- #
 st.markdown("---")
-st.caption("Tip: draw rooftop polygon on Map page, then go to Forecast → Panel Layout → Reports.")
+st.subheader("📋 Summary")
+st.write(f"""
+- **Location:** {lat:.5f}, {lon:.5f}
+- **Rooftop:** {roof_w:.1f} × {roof_h:.1f} m (Area {roof_area:.1f} m²), Clearance {clearance:.2f} m
+- **Panels:** {count} × {panel_watt} W ({orientation}), System = **{system_kw:.2f} kW**
+- **Annual Output:** **{annual_energy:,} kWh**
+- **Cost:** ₹{install_cost:,.0f} | **Savings:** ₹{annual_savings:,.0f}/yr | **Payback:** {payback_years} yrs
+- **Suitability:** **{score}/100**
+""")
+st.caption("Note: Estimates are indicative. On-site shading analysis and structural checks are recommended before installation.")
